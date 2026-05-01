@@ -123,6 +123,30 @@
       <span style="margin-left: 8px; color: #888">-1 表示不限</span>
     </el-form-item>
 
+    <el-form-item label="服务实例池" prop="endpoints">
+      <div class="endpoints-pool">
+        <div class="endpoints-header">
+          <span class="endpoints-tip">多实例端点池，独立URL与并发分配</span>
+          <el-button text type="primary" @click="addEndpoint">
+            <el-icon><Plus /></el-icon> 添加实例
+          </el-button>
+        </div>
+        <div v-if="form.endpoints?.length" class="endpoints-list">
+          <div v-for="(ep, idx) in form.endpoints" :key="idx" class="endpoint-item">
+            <el-input v-model="ep.url" placeholder="http://127.0.0.1:7101/v1" style="flex: 1;" />
+            <span class="concurrency-label">并发</span>
+            <el-input-number v-model="ep.concurrency" :min="1" :max="100" />
+            <el-button text type="danger" @click="removeEndpoint(idx)">
+              <el-icon><Delete /></el-icon>
+            </el-button>
+          </div>
+        </div>
+        <div v-else class="endpoints-empty">
+          未配置端点池，将使用上方 API Base
+        </div>
+      </div>
+    </el-form-item>
+
     <el-form-item>
       <el-button @click="handleCancel">取消</el-button>
       <el-button type="primary" @click="handleSubmit">保存</el-button>
@@ -136,7 +160,7 @@ import { computed, reactive, ref, watch } from 'vue'
 import type { components } from '@renderer/types/generated'
 import type { FormInstance, FormRules } from 'element-plus'
 import { ElMessage } from 'element-plus'
-import { Refresh } from '@element-plus/icons-vue'
+import { Refresh, Plus, Delete } from '@element-plus/icons-vue'
 
 import { getLLMModels, testLLMConnection } from '@renderer/api/setting'
 
@@ -168,6 +192,7 @@ const form = reactive({
   user_agent: '',
   token_limit: -1,
   call_limit: -1,
+  endpoints: [] as { url: string; concurrency: number }[],
 })
 
 const isOpenAIProvider = computed(() => form.provider === 'openai' || form.provider === 'openai_compatible')
@@ -217,6 +242,7 @@ watch(
       form.user_agent = (newData as any).user_agent || ''
       form.token_limit = (newData as any).token_limit ?? -1
       form.call_limit = (newData as any).call_limit ?? -1
+      form.endpoints = (newData as any).endpoints || []
       showAdvancedTransport.value = form.api_protocol !== 'chat_completions' || !!form.custom_request_path || !!form.models_path || !!form.user_agent
       showRareTransportFields.value = !!form.custom_request_path || !!form.models_path || !!form.user_agent
       return
@@ -234,6 +260,7 @@ watch(
     form.user_agent = ''
     form.token_limit = -1
     form.call_limit = -1
+    form.endpoints = []
     showAdvancedTransport.value = false
     showRareTransportFields.value = false
   },
@@ -293,6 +320,17 @@ async function handleFetchModels() {
 
 function handleCancel() {
   emit('cancel')
+}
+
+function addEndpoint() {
+  if (!form.endpoints) {
+    form.endpoints = []
+  }
+  form.endpoints.push({ url: 'http://127.0.0.1:7101/v1', concurrency: 4 })
+}
+
+function removeEndpoint(idx: number) {
+  form.endpoints?.splice(idx, 1)
 }
 
 async function handleTest() {
@@ -389,5 +427,55 @@ async function handleTest() {
 .inline-item :deep(.el-select),
 .inline-item :deep(.el-input) {
   width: 100%;
+}
+
+.endpoints-pool {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+}
+
+.endpoints-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.endpoints-tip {
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+}
+
+.endpoints-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 8px;
+  background: var(--el-fill-color-extra-light);
+}
+
+.endpoint-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.concurrency-label {
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+  white-space: nowrap;
+}
+
+.endpoints-empty {
+  font-size: 12px;
+  color: var(--el-text-color-placeholder);
+  padding: 8px;
+  text-align: center;
+  border: 1px dashed var(--el-border-color-lighter);
+  border-radius: 8px;
 }
 </style>

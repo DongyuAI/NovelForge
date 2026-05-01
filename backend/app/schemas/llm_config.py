@@ -1,9 +1,15 @@
 
 from sqlmodel import SQLModel
-from typing import Literal, Optional
+from typing import Literal, Optional, List
 
 
 LLMApiProtocol = Literal["chat_completions", "responses"]
+
+
+class EndpointConfigSchema(SQLModel):
+    url: str
+    concurrency: int = 4
+
 
 class LLMConfigBase(SQLModel):
     provider: str
@@ -15,6 +21,7 @@ class LLMConfigBase(SQLModel):
     custom_request_path: Optional[str] = None
     models_path: Optional[str] = None
     user_agent: Optional[str] = None
+    endpoints: Optional[List[dict]] = None
     # 配额（-1 表示不限）与统计（只读场景外部可见）
     token_limit: Optional[int] = -1
     call_limit: Optional[int] = -1
@@ -40,6 +47,7 @@ class LLMConfigUpdate(SQLModel):
     custom_request_path: Optional[str] = None
     models_path: Optional[str] = None
     user_agent: Optional[str] = None
+    endpoints: Optional[List[dict]] = None
     token_limit: Optional[int] = None
     call_limit: Optional[int] = None
     rpm_limit: Optional[int] = None

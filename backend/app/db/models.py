@@ -15,6 +15,13 @@ class Project(SQLModel, table=True):
 
 
 
+class EndpointConfig(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    llm_config_id: int = Field(foreign_key="llmconfig.id")
+    url: str = Field(description="服务实例请求地址")
+    concurrency: int = Field(default=4, description="该实例独立的最大并发量")
+
+
 class LLMConfig(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     provider: str = Field(index=True)
@@ -22,6 +29,12 @@ class LLMConfig(SQLModel, table=True):
     model_name: str
     api_base: Optional[str] = None
     api_key: str
+    # 多实例端点池（独立URL与并发分配）
+    endpoints: Optional[List[dict]] = Field(
+        default=None,
+        sa_column=Column(JSON),
+        description="端点配置列表，每项包含 url 和 concurrency"
+    )
     # 这里必须带 server_default，启动期自动补列逻辑才会认为它是“安全追加列”。
     # 仅有 Python 默认值不够，旧库在 ALTER TABLE 时需要数据库侧默认值来回填历史行。
     api_protocol: str = Field(

@@ -4,6 +4,7 @@
 """
 
 from typing import Optional
+from itertools import cycle
 
 from langchain_anthropic import ChatAnthropic
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -58,6 +59,8 @@ def build_chat_model_from_payload(
     api_protocol: str | None = None,
     custom_request_path: str | None = None,
     user_agent: str | None = None,
+    endpoints: list[dict] | None = None,
+    llm_config_id: int | None = None,
     temperature: Optional[float] = None,
     max_tokens: Optional[int] = None,
     timeout: Optional[float] = None,
@@ -66,9 +69,20 @@ def build_chat_model_from_payload(
     if not api_key:
         raise ValueError("未提供 API Key")
 
+    # 如果配置了端点池，优先从池中获取URL
+    resolved_api_base = api_base
+    if endpoints and llm_config_id:
+        pool = llm_config_service.get_endpoint_pool(llm_config_id, endpoints)
+        if pool:
+            endpoint_url = pool.get_endpoint()
+            if endpoint_url:
+                resolved_api_base = endpoint_url
+    elif endpoints and endpoints[0].get("url"):
+        resolved_api_base = endpoints[0].get("url")
+
     transport = llm_config_service.resolve_transport_settings(
         provider=provider,
-        api_base=api_base,
+        api_base=resolved_api_base,
         base_url=base_url,
         api_protocol=api_protocol,
         custom_request_path=custom_request_path,

@@ -1,9 +1,66 @@
 from urllib.parse import urljoin
+from itertools import cycle
+from collections import deque
 
 from sqlmodel import Session, select
 
 from app.db.models import LLMConfig
 from app.schemas.llm_config import LLMConfigCreate, LLMConfigUpdate
+
+
+class EndpointPool:
+    """多实例端点池并发管理器（同步版本）"""
+
+    def __init__(self, endpoints: list[dict]):
+        self._endpoints = endpoints or []
+        self._available: deque = deque()
+        self._init_pool()
+
+    def _init_pool(self):
+        if not self._endpoints:
+            return
+        for ep in self._endpoints:
+            url = ep.get("url", "")
+            concurrency = ep.get("concurrency", 4)
+            for _ in range(max(1, concurrency)):
+                self._available.append(url)
+
+    def get_endpoint(self) -> str | None:
+        """获取一个可用端点URL（轮询负载均衡）"""
+        if not self._available:
+            if self._endpoints:
+                return self._endpoints[0].get("url")
+            return None
+        url = self._available.popleft()
+        self._available.append(url)
+        return url
+
+    def release_endpoint(self, url: str):
+        """释放端点回池（同步版本无需操作，端点一直在循环中）"""
+        pass
+
+    @property
+    def endpoints(self) -> list[dict]:
+        return self._endpoints
+
+
+_endpoint_pools: dict[int, EndpointPool] = {}
+
+
+def get_endpoint_pool(config_id: int, endpoints: list[dict] | None = None) -> EndpointPool | None:
+    """获取或创建端点池实例"""
+    if config_id in _endpoint_pools:
+        return _endpoint_pools[config_id]
+    if endpoints:
+        pool = EndpointPool(endpoints)
+        _endpoint_pools[config_id] = pool
+        return pool
+    return None
+
+
+def clear_endpoint_pool(config_id: int):
+    """清除端点池缓存"""
+    _endpoint_pools.pop(config_id, None)
 
 
 def _normalize_protocol(value: str | None) -> str:
