@@ -129,17 +129,6 @@
       @cancel="showInitialPromptDialog = false"
     />
 
-    <!-- 生成面板（悬浮窗）-->
-    <GenerationPanel
-      ref="generationPanelRef"
-      :visible="showGenerationPanel"
-      @close="handleCloseGenerationPanel"
-      @pause="handlePauseGeneration"
-      @continue="handleContinueGeneration"
-      @stop="handleStopGeneration"
-      @restart="handleRestartGeneration"
-    />
-
     <el-dialog v-model="stageReviewDialogVisible" title="审核结果" width="72%">
       <div v-if="stageReviewText" class="stage-review-dialog-body">
         <div class="stage-review-overview">
@@ -207,6 +196,7 @@ import SimpleMarkdown from '../common/SimpleMarkdown.vue'
 import { addVersion } from '@renderer/services/versionService'
 import { List, Select, Loading } from '@element-plus/icons-vue'
 import { useAppStore } from '@renderer/stores/useAppStore'
+import { useGenerationStore } from '@renderer/stores/useGenerationStore'
 import { useAIStore as useAIStoreForOptions } from '@renderer/stores/useAIStore'
 import SchemaStudio from '../shared/SchemaStudio.vue'
 import AIPerCardParams from '../common/AIPerCardParams.vue'
@@ -228,8 +218,6 @@ import {
   type ReviewRunRequest,
   upsertReviewCard,
 } from '@renderer/api/chapterReviews'
-// 指令流生成相关导入
-import GenerationPanel from '../generation/GenerationPanel.vue'
 import InitialPromptDialog from '../generation/InitialPromptDialog.vue'
 import { InstructionExecutor } from '@renderer/services/instructionExecutor'
 import { generateWithInstructionStream } from '@renderer/api/generation'
@@ -246,6 +234,7 @@ const perCardStore = usePerCardAISettingsStore()
 const projectStore = useProjectStore()
 const aiStoreForOptions = useAIStoreForOptions()
 const appStore = useAppStore()
+const generationStore = useGenerationStore()
 
 const { cards } = storeToRefs(cardStore)
 const isDarkMode = computed(() => appStore.isDarkMode)
@@ -268,9 +257,7 @@ const prefetchedContext = ref<any>(null)
 // 指令流生成相关状态
 const showInitialPromptDialog = ref(false)
 const showGenerationPanel = ref(false)
-const generationPanelRef = ref<InstanceType<typeof GenerationPanel>>()
 const instructionExecutor = ref<InstructionExecutor | null>(null)
-const currentAbortController = ref<AbortController | null>(null)
 const conversationHistory = ref<ConversationMessage[]>([])
 
 // --- 内容编辑器动态映射 ---
@@ -1066,34 +1053,17 @@ async function handleStartGeneration(userPrompt: string, useExistingContent: boo
     const initialData = useExistingContent ? (editingContent || {}) : {}
     instructionExecutor.value = new InstructionExecutor(initialData)
 
-    // 4. 重置对话历史
     conversationHistory.value = []
 
-    // 5. 显示生成面板并重置状态
     showGenerationPanel.value = true
+    generationStore.startGeneration(props.card.id, props.card.title)
     await nextTick()
 
-    // 重置面板状态（清空消息）
-    if (generationPanelRef.value) {
-      generationPanelRef.value.reset()
+    if (userPrompt) {
+      generationStore.addMessage(props.card.id, 'user', userPrompt)
     }
 
-    // 6. 显示用户要求（如果有）
-    // 必须要要在 reset 之后添加，否则会被 reset 清空
-    if (userPrompt && generationPanelRef.value) {
-      console.log('Adding user prompt to panel:', userPrompt)
-      // 使用 setTimeout 确保在 reset 的 DOM 更新后执行
-      setTimeout(() => {
-        generationPanelRef.value?.addMessage('user', userPrompt)
-      }, 0)
-    }
-
-    // 7. 开始生成
-    if (generationPanelRef.value) {
-      generationPanelRef.value.startGeneration()
-    }
-
-    // 8. 调用生成 API
+    // 调用生成 API
     await performGeneration(userPrompt, effective, resolvedContext, p, useExistingContent)
   } catch (e) {
     console.error('启动生成失败:', e)
@@ -1111,8 +1081,7 @@ async function performGeneration(
   params: PerCardAIParams,
   useExistingContent: boolean
 ) {
-  // 创建 AbortController
-  currentAbortController.value = new AbortController()
+  const signal = generationStore.getAbortSignal(props.card.id)
 
   try {
     await generateWithInstructionStream(
@@ -1120,7 +1089,6 @@ async function performGeneration(
         llm_config_id: params.llm_config_id!,
         user_prompt: userPrompt,
         response_model_schema: schema,
-        // 根据选项决定是否传递现有内容
         current_data: useExistingContent ? (instructionExecutor.value?.getData() || {}) : {},
         conversation_context: conversationHistory.value,
         context_info: contextInfo,
@@ -1131,13 +1099,11 @@ async function performGeneration(
       },
       {
         onThinking: (text) => {
-          generationPanelRef.value?.addMessage('thinking', text)
+          generationStore.addMessage(props.card.id, 'thinking', text)
         },
         onInstruction: (instruction: Instruction) => {
-          // 执行指令
           instructionExecutor.value?.execute(instruction)
 
-          // 更新 UI
           const data = instructionExecutor.value?.getData()
           if (data) {
             import('lodash-es').then(({ cloneDeep }) => {
@@ -1150,21 +1116,19 @@ async function performGeneration(
             })
           }
 
-          // 显示指令执行消息
           const actionText = formatInstructionAction(instruction)
-          generationPanelRef.value?.addMessage('action', actionText)
-          generationPanelRef.value?.incrementCompletedFields()
+          generationStore.addMessage(props.card.id, 'instruction', actionText)
+          generationStore.incrementCompleted(props.card.id)
         },
         onWarning: (text) => {
-          generationPanelRef.value?.addMessage('warning', text)
+          generationStore.addMessage(props.card.id, 'warning', text)
         },
         onError: (text) => {
-          generationPanelRef.value?.addMessage('error', text)
-          generationPanelRef.value?.finishGeneration(false, text)
+          generationStore.addMessage(props.card.id, 'error', text)
+          generationStore.finishGeneration(props.card.id, false, text)
         },
         onDone: async (success, message, finalData) => {
           if (success) {
-            // 如果后端回传了最终完整数据（包含默认值注入），则合并更新
             if (finalData) {
               console.log('Received final data from backend:', finalData)
               const { mergeWith, isArray } = await import('lodash-es')
@@ -1182,20 +1146,26 @@ async function performGeneration(
                 localData.value = merged
               }
             }
-            generationPanelRef.value?.finishGeneration(true, message)
+            generationStore.finishGeneration(props.card.id, true, message)
             ElMessage.success(message || '生成完成！')
+            try {
+              const saveData = wrapperName.value ? innerData.value : localData.value
+              await cardStore.modifyCard(props.card.id, { content: saveData } as any)
+            } catch (e) {
+              console.error('Auto-save failed:', e)
+            }
           } else {
-            generationPanelRef.value?.finishGeneration(false, message)
+            generationStore.finishGeneration(props.card.id, false, message)
           }
         }
       },
-      currentAbortController.value.signal
+      generationStore.getAbortSignal(props.card.id)
     )
   } catch (error: any) {
     if (error.name !== 'AbortError') {
       console.error('生成失败:', error)
-      generationPanelRef.value?.addMessage('error', error.message || '生成失败')
-      generationPanelRef.value?.finishGeneration(false)
+      generationStore.addMessage(props.card.id, 'error', error.message || '生成失败')
+      generationStore.finishGeneration(props.card.id, false)
     }
   }
 }
@@ -1220,12 +1190,7 @@ function formatInstructionAction(instruction: Instruction): string {
  * 关闭生成面板
  */
 function handleCloseGenerationPanel() {
-  // 中断当前生成
-  if (currentAbortController.value) {
-    currentAbortController.value.abort()
-    currentAbortController.value = null
-  }
-
+  generationStore.stopGeneration(props.card.id)
   showGenerationPanel.value = false
   instructionExecutor.value = null
   conversationHistory.value = []
@@ -1235,10 +1200,7 @@ function handleCloseGenerationPanel() {
  * 暂停生成
  */
 function handlePauseGeneration() {
-  if (currentAbortController.value) {
-    currentAbortController.value.abort()
-    currentAbortController.value = null
-  }
+  generationStore.pauseGeneration(props.card.id)
 }
 
 /**

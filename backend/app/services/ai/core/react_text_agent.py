@@ -9,7 +9,12 @@ from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, Sys
 from loguru import logger
 from sqlmodel import Session
 
-from app.services.ai.core.chat_model_factory import build_chat_model
+from app.services.ai.core.chat_model_factory import (
+    build_chat_model,
+    _get_instance_semaphore,
+    _get_global_sem,
+    _get_instance_concurrency,
+)
 from app.services.ai.core.quota_manager import precheck_quota, record_usage
 from app.services.ai.core.token_utils import calc_input_tokens, estimate_tokens
 
@@ -443,165 +448,175 @@ async def stream_chat_with_react_protocol(
     if not ok:
         raise ValueError(f"LLM配额不足: {reason}")
 
-    model = build_chat_model(
-        session=session,
-        llm_config_id=llm_config_id,
-        temperature=temperature or 0.6,
-        max_tokens=max_tokens,
-        timeout=timeout or 90,
-        thinking_enabled=thinking_enabled,
-    )
+    instance_concurrency = _get_instance_concurrency(session, llm_config_id)
+    instance_sem = _get_instance_semaphore(llm_config_id, instance_concurrency)
 
-    if set_deps is not None:
-        set_deps(deps)
-
-    messages: list[Any] = [SystemMessage(content=system_prompt)]
-
-    for item in history_messages or []:
-        if not isinstance(item, dict):
-            continue
-        role = str(item.get("role") or "").strip().lower()
-        content = item.get("content")
-        if not isinstance(content, str) or not content.strip():
-            continue
-        text = content.strip()
-        if role == "user":
-            messages.append(HumanMessage(content=text))
-        elif role == "assistant":
-            messages.append(AIMessage(content=text))
-
-    messages.append(HumanMessage(content=final_user_prompt))
-
-    accumulated_text = ""
-    reasoning_accumulated = ""
-    usage_in_total = 0
-    usage_out_total = 0
+    await instance_sem.acquire()
+    await _get_global_sem().acquire()
 
     try:
+        model = build_chat_model(
+            session=session,
+            llm_config_id=llm_config_id,
+            temperature=temperature or 0.6,
+            max_tokens=max_tokens,
+            timeout=timeout or 90,
+            thinking_enabled=thinking_enabled,
+        )
+
+        if set_deps is not None:
+            set_deps(deps)
+
+        messages: list[Any] = [SystemMessage(content=system_prompt)]
+
+        for item in history_messages or []:
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role") or "").strip().lower()
+            content = item.get("content")
+            if not isinstance(content, str) or not content.strip():
+                continue
+            text = content.strip()
+            if role == "user":
+                messages.append(HumanMessage(content=text))
+            elif role == "assistant":
+                messages.append(AIMessage(content=text))
+
+        messages.append(HumanMessage(content=final_user_prompt))
+
+        accumulated_text = ""
+        reasoning_accumulated = ""
+        usage_in_total = 0
+        usage_out_total = 0
+
         completed = False
 
-        for _step in range(max_steps):
-            full_chunk: Optional[AIMessageChunk] = None
-            step_text = ""
-            stream_state: dict[str, str] = {"buffer": ""}
-            step_usage_in: Optional[int] = None
-            step_usage_out: Optional[int] = None
-            step_input_fallback = _estimate_messages_input_tokens(messages)
+        try:
+            for _step in range(max_steps):
+                full_chunk: Optional[AIMessageChunk] = None
+                step_text = ""
+                stream_state: dict[str, str] = {"buffer": ""}
+                step_usage_in: Optional[int] = None
+                step_usage_out: Optional[int] = None
+                step_input_fallback = _estimate_messages_input_tokens(messages)
 
-            async for chunk in model.astream(messages):
-                if not isinstance(chunk, AIMessageChunk):
-                    continue
+                async for chunk in model.astream(messages):
+                    if not isinstance(chunk, AIMessageChunk):
+                        continue
 
-                chunk_in_tokens, chunk_out_tokens = _extract_usage_from_chunk(chunk)
-                if chunk_in_tokens > 0:
-                    step_usage_in = chunk_in_tokens
-                if chunk_out_tokens > 0:
-                    step_usage_out = chunk_out_tokens
+                    chunk_in_tokens, chunk_out_tokens = _extract_usage_from_chunk(chunk)
+                    if chunk_in_tokens > 0:
+                        step_usage_in = chunk_in_tokens
+                    if chunk_out_tokens > 0:
+                        step_usage_out = chunk_out_tokens
 
-                delta_text, delta_reasonings = _extract_chunk_parts(chunk)
-                if delta_text:
-                    step_text += delta_text
+                    delta_text, delta_reasonings = _extract_chunk_parts(chunk)
+                    if delta_text:
+                        step_text += delta_text
 
-                for seg in delta_reasonings or []:
-                    if seg:
-                        reasoning_accumulated += seg
-                        yield {"type": "reasoning", "data": {"text": seg, "delta": True}}
+                    for seg in delta_reasonings or []:
+                        if seg:
+                            reasoning_accumulated += seg
+                            yield {"type": "reasoning", "data": {"text": seg, "delta": True}}
 
-                cleaned_delta = _process_react_stream_text(stream_state, delta_text or "")
-                if cleaned_delta:
-                    accumulated_text += cleaned_delta
-                    yield {"type": "token", "data": {"text": cleaned_delta, "delta": True}}
+                    cleaned_delta = _process_react_stream_text(stream_state, delta_text or "")
+                    if cleaned_delta:
+                        accumulated_text += cleaned_delta
+                        yield {"type": "token", "data": {"text": cleaned_delta, "delta": True}}
 
-                if full_chunk is None:
-                    full_chunk = chunk
+                    if full_chunk is None:
+                        full_chunk = chunk
+                    else:
+                        full_chunk = full_chunk + chunk
+
+                tail_text = _flush_react_stream_state(stream_state)
+                if tail_text:
+                    accumulated_text += tail_text
+                    yield {"type": "token", "data": {"text": tail_text, "delta": True}}
+
+                response = _chunk_to_message(full_chunk, step_text)
+                messages.append(response)
+
+                if step_usage_in is not None and step_usage_out is not None:
+                    usage_in_total += max(0, step_usage_in)
+                    usage_out_total += max(0, step_usage_out)
                 else:
-                    full_chunk = full_chunk + chunk
+                    usage_in_total += max(0, step_input_fallback)
+                    usage_out_total += max(0, estimate_tokens(step_text))
 
-            tail_text = _flush_react_stream_state(stream_state)
-            if tail_text:
-                accumulated_text += tail_text
-                yield {"type": "token", "data": {"text": tail_text, "delta": True}}
+                action_payload = _parse_action_payload(step_text)
+                if action_payload:
+                    tool_name, tool_args = action_payload
+                    yield {
+                        "type": "tool_start",
+                        "data": {"tool_name": tool_name, "args": tool_args},
+                    }
 
-            response = _chunk_to_message(full_chunk, step_text)
-            messages.append(response)
+                    success = True
+                    try:
+                        tool_result = await _invoke_tool_from_registry(
+                            tool_registry,
+                            tool_name,
+                            tool_args,
+                            log_tag=log_tag,
+                        )
+                    except Exception as tool_err:
+                        success = False
+                        tool_result = {"success": False, "error": str(tool_err)}
 
-            if step_usage_in is not None and step_usage_out is not None:
-                usage_in_total += max(0, step_usage_in)
-                usage_out_total += max(0, step_usage_out)
-            else:
-                usage_in_total += max(0, step_input_fallback)
-                usage_out_total += max(0, estimate_tokens(step_text))
+                    yield {
+                        "type": "tool_end",
+                        "data": {
+                            "tool_name": tool_name,
+                            "args": tool_args,
+                            "result": tool_result,
+                            "success": success,
+                        },
+                    }
 
-            action_payload = _parse_action_payload(step_text)
-            if action_payload:
-                tool_name, tool_args = action_payload
-                yield {
-                    "type": "tool_start",
-                    "data": {"tool_name": tool_name, "args": tool_args},
-                }
-
-                success = True
-                try:
-                    tool_result = await _invoke_tool_from_registry(
-                        tool_registry,
-                        tool_name,
-                        tool_args,
-                        log_tag=log_tag,
-                    )
-                except Exception as tool_err:
-                    success = False
-                    tool_result = {"success": False, "error": str(tool_err)}
-
-                yield {
-                    "type": "tool_end",
-                    "data": {
-                        "tool_name": tool_name,
-                        "args": tool_args,
-                        "result": tool_result,
-                        "success": success,
-                    },
-                }
-
-                messages.append(
-                    HumanMessage(
-                        content=f"Observation ({tool_name}):\n{json.dumps(tool_result, ensure_ascii=False)}"
-                    )
-                )
-                continue
-
-            if _contains_action_marker(step_text):
-                logger.warning(
-                    "[{}] 检测到 Action 标记但解析失败，要求模型按规范重发。step={} preview={}",
-                    log_tag,
-                    _step + 1,
-                    (step_text or "")[:240],
-                )
-                messages.append(
-                    HumanMessage(
-                        content=(
-                            "你上一条消息包含工具调用意图，但格式无法解析。"
-                            "请严格只输出一个可解析的工具调用块："
-                            "<Action>{\"tool\":\"工具名\",\"args\":{...}}</Action>。"
-                            "不要输出多余解释文本。"
+                    messages.append(
+                        HumanMessage(
+                            content=f"Observation ({tool_name}):\n{json.dumps(tool_result, ensure_ascii=False)}"
                         )
                     )
-                )
-                continue
+                    continue
 
-            completed = True
-            break
+                if _contains_action_marker(step_text):
+                    logger.warning(
+                        "[{}] 检测到 Action 标记但解析失败，要求模型按规范重发。step={} preview={}",
+                        log_tag,
+                        _step + 1,
+                        (step_text or "")[:240],
+                    )
+                    messages.append(
+                        HumanMessage(
+                            content=(
+                                "你上一条消息包含工具调用意图，但格式无法解析。"
+                                "请严格只输出一个可解析的工具调用块："
+                                "<Action>{\"tool\":\"工具名\",\"args\":{...}}</Action>。"
+                                "不要输出多余解释文本。"
+                            )
+                        )
+                    )
+                    continue
 
-        if not completed:
-            raise RuntimeError("React模式达到最大思考轮数仍未结束")
+                completed = True
+                break
 
-    except asyncio.CancelledError:
+            if not completed:
+                raise RuntimeError("React模式达到最大思考轮数仍未结束")
+
+        except asyncio.CancelledError:
+            in_tokens = usage_in_total or calc_input_tokens(system_prompt, final_user_prompt)
+            out_tokens = usage_out_total or estimate_tokens(accumulated_text + reasoning_accumulated)
+            record_usage(session, llm_config_id, in_tokens, out_tokens, calls=1, aborted=True)
+            raise
+        except Exception:
+            raise
+
         in_tokens = usage_in_total or calc_input_tokens(system_prompt, final_user_prompt)
         out_tokens = usage_out_total or estimate_tokens(accumulated_text + reasoning_accumulated)
-        record_usage(session, llm_config_id, in_tokens, out_tokens, calls=1, aborted=True)
-        raise
-    except Exception:
-        raise
-
-    in_tokens = usage_in_total or calc_input_tokens(system_prompt, final_user_prompt)
-    out_tokens = usage_out_total or estimate_tokens(accumulated_text + reasoning_accumulated)
-    record_usage(session, llm_config_id, in_tokens, out_tokens, calls=1, aborted=False)
+        record_usage(session, llm_config_id, in_tokens, out_tokens, calls=1, aborted=False)
+    finally:
+        instance_sem.release()
+        _get_global_sem().release()

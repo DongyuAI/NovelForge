@@ -3,8 +3,10 @@
 统一管理 LLM 配置读取与 LangChain ChatModel 构建，避免业务层重复拼装参数。
 """
 
+import asyncio
 from typing import Optional
 from itertools import cycle
+from collections import deque
 
 from langchain_anthropic import ChatAnthropic
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -14,6 +16,89 @@ from sqlmodel import Session
 
 from app.db.models import LLMConfig
 from app.services import llm_config_service
+
+_llm_instance_semaphores: dict[int, asyncio.Semaphore] = {}
+_llm_instance_concurrency: dict[int, int] = {}
+_llm_instance_active: dict[int, int] = {}
+_global_sem: Optional[asyncio.Semaphore] = None
+
+
+def get_llm_status() -> dict:
+    """获取 LLM 并发状态"""
+    return {
+        "instances": {
+            config_id: {
+                "limit": conc,
+                "active": _llm_instance_active.get(config_id, 0),
+            }
+            for config_id, conc in _llm_instance_concurrency.items()
+        },
+        "global": {
+            "limit": _get_global_sem()._value,
+            "active": sum(_llm_instance_active.values()),
+        }
+    }
+
+
+def _acquire_instance(llm_config_id: int) -> None:
+    """增加实例活动计数"""
+    _llm_instance_active[llm_config_id] = _llm_instance_active.get(llm_config_id, 0) + 1
+
+
+def _release_instance(llm_config_id: int) -> None:
+    """减少实例活动计数"""
+    current = _llm_instance_active.get(llm_config_id, 0)
+    _llm_instance_active[llm_config_id] = max(0, current - 1)
+
+
+def _get_global_sem() -> asyncio.Semaphore:
+    """获取全局信号量（自动计算所有实例并发之和）"""
+    global _global_sem
+    if _global_sem is None:
+        total = sum(_llm_instance_concurrency.values()) or 30
+        _global_sem = asyncio.Semaphore(max(1, total))
+    return _global_sem
+
+
+def _update_global_sem() -> None:
+    """更新全局信号量（当实例配置变化时调用）"""
+    global _global_sem
+    total = sum(_llm_instance_concurrency.values()) or 30
+    _global_sem = asyncio.Semaphore(max(1, total))
+
+
+def _get_instance_semaphore(llm_config_id: int, concurrency: int = 4) -> asyncio.Semaphore:
+    """获取或创建单个 LLM 实例的并发控制信号量"""
+    if llm_config_id not in _llm_instance_semaphores:
+        _llm_instance_semaphores[llm_config_id] = asyncio.Semaphore(max(1, concurrency))
+        _llm_instance_concurrency[llm_config_id] = max(1, concurrency)
+        _llm_instance_active[llm_config_id] = 0
+        _update_global_sem()
+    return _llm_instance_semaphores[llm_config_id]
+
+
+def set_llm_instance_concurrency(llm_config_id: int, concurrency: int) -> None:
+    """动态调整单个 LLM 实例的并发限制"""
+    _llm_instance_semaphores[llm_config_id] = asyncio.Semaphore(max(1, concurrency))
+    _llm_instance_concurrency[llm_config_id] = max(1, concurrency)
+    _update_global_sem()
+
+
+def set_llm_global_concurrency(limit: int) -> None:
+    """设置全局并发限制（手动覆盖）"""
+    global _global_sem
+    _global_sem = asyncio.Semaphore(max(1, limit))
+
+
+def _get_instance_concurrency(session: Session, llm_config_id: int) -> int:
+    """获取 LLM 配置的并发限制（从 endpoints 累加）"""
+    cfg = llm_config_service.get_llm_config(session, llm_config_id)
+    if not cfg:
+        return 4
+    if cfg.endpoints:
+        total = sum(ep.get("concurrency", 4) for ep in cfg.endpoints)
+        return max(1, total)
+    return getattr(cfg, "concurrency", 4)
 
 
 def _sanitize_common_generation_kwargs(
@@ -151,6 +236,15 @@ def _get_llm_config(session: Session, llm_config_id: int) -> LLMConfig:
     if not cfg.api_key:
         raise ValueError(f"未找到 LLM 配置 {cfg.display_name or cfg.model_name} 的 API 密钥")
     return cfg
+
+
+def _get_instance_concurrency(session: Session, llm_config_id: int) -> int:
+    """获取 LLM 配置的并发限制"""
+    cfg = _get_llm_config(session, llm_config_id)
+    if cfg.endpoints:
+        total = sum(ep.get("concurrency", 4) for ep in cfg.endpoints)
+        return max(1, total)
+    return getattr(cfg, "concurrency", 4)
 
 
 def build_chat_model(

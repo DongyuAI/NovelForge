@@ -3,6 +3,7 @@
 提供单轮 LLM 调用能力，支持提示词模板和结构化输出。
 """
 
+import asyncio
 import json
 from typing import Any, Dict, Optional, AsyncIterator
 from pydantic import BaseModel, Field
@@ -10,7 +11,14 @@ from loguru import logger
 
 from ...registry import register_node
 from ..base import BaseNode
-from app.services.ai.core.chat_model_factory import build_chat_model
+from app.services.ai.core.chat_model_factory import (
+    build_chat_model,
+    _get_instance_semaphore,
+    _get_global_sem,
+    _get_instance_concurrency,
+    _acquire_instance,
+    _release_instance,
+)
 from langchain_core.messages import HumanMessage, SystemMessage
 
 
@@ -109,10 +117,16 @@ class LLMGenerateNode(BaseNode[LLMInput, LLMOutput]):
     input_model = LLMInput
     output_model = LLMOutput
 
-    async def execute(self, input_data: LLMInput) -> AsyncIterator[LLMOutput]:
+async def execute(self, input_data: LLMInput) -> AsyncIterator[LLMOutput]:
         """执行 LLM 调用"""
         
-        # 构建 ChatModel (在重试循环外,避免重复构建)
+        instance_concurrency = _get_instance_concurrency(self.context.session, input_data.llm_config_id)
+        instance_sem = _get_instance_semaphore(input_data.llm_config_id, instance_concurrency)
+
+        await instance_sem.acquire()
+        _acquire_instance(input_data.llm_config_id)
+        await _get_global_sem().acquire()
+
         try:
             model = build_chat_model(
                 session=self.context.session,
@@ -123,26 +137,24 @@ class LLMGenerateNode(BaseNode[LLMInput, LLMOutput]):
             )
         except Exception as e:
             logger.error(f"[AI.LLM] 构建模型失败: {e}")
+            instance_sem.release()
+            _release_instance(input_data.llm_config_id)
+            _get_global_sem().release()
             raise ValueError(f"构建模型失败: {str(e)}")
         
-        # 构建消息
         messages = []
         if input_data.system_prompt:
             messages.append(SystemMessage(content=input_data.system_prompt))
         messages.append(HumanMessage(content=input_data.user_prompt))
         
-        # 重试循环
         last_error = None
-        for attempt in range(input_data.max_retry + 1):  # +1 因为第一次不算重试
+        for attempt in range(input_data.max_retry + 1):
             try:
-                # 调用模型
                 response = await model.ainvoke(messages)
                 
-                # 提取文本（兼容 content 为 list/dict 的模型返回）
                 payload = response.content if hasattr(response, 'content') else response
                 response_text = _extract_text(payload)
                 
-                # 提取 usage 信息
                 usage = {}
                 if hasattr(response, 'usage_metadata'):
                     usage = response.usage_metadata
@@ -156,6 +168,9 @@ class LLMGenerateNode(BaseNode[LLMInput, LLMOutput]):
                     f"llm_config_id={input_data.llm_config_id}, response_length={len(response_text)}"
                 )
                 
+                instance_sem.release()
+                _release_instance(input_data.llm_config_id)
+                _get_global_sem().release()
                 yield LLMOutput(
                     response=response_text,
                     usage=usage
@@ -174,6 +189,8 @@ class LLMGenerateNode(BaseNode[LLMInput, LLMOutput]):
                         f"[AI.LLM] LLM 调用失败,已达最大重试次数 ({input_data.max_retry + 1}): {str(e)}"
                     )
         
-        # 所有重试都失败
+        instance_sem.release()
+        _release_instance(input_data.llm_config_id)
+        _get_global_sem().release()
         raise RuntimeError(f"LLM 调用失败 (重试{input_data.max_retry}次后): {str(last_error)}")
 

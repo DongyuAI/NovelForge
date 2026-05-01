@@ -68,6 +68,20 @@ export async function copyLLMConfig(id: number): Promise<LLMConfigRead> {
   return await request.post<LLMConfigRead>(`/llm-configs/${id}/copy`, {})
 }
 
+export interface LLMStatus {
+  instances: Record<number, {
+    display_name?: string
+    limit: number
+    active: number
+    endpoint_pool?: { url: string; limit: number; active: number }[]
+  }>
+  global: { limit: number; active: number }
+}
+
+export async function getLLMStatus(): Promise<LLMStatus> {
+  return await request.get<LLMStatus>('/llm-configs/status')
+}
+
 // --- 提示词 API ---
 export interface Prompt { id: number; name: string; description: string; template: string; built_in?: boolean }
 export async function listPrompts(): Promise<Prompt[]> { return await request.get<Prompt[]>('/prompts') }

@@ -1,6 +1,7 @@
 from urllib.parse import urljoin
 from itertools import cycle
 from collections import deque
+import asyncio
 
 from sqlmodel import Session, select
 
@@ -8,12 +9,41 @@ from app.db.models import LLMConfig
 from app.schemas.llm_config import LLMConfigCreate, LLMConfigUpdate
 
 
+class EndpointInstance:
+    """单个端点实例"""
+
+    def __init__(self, url: str, concurrency: int = 4):
+        self.url = url
+        self.concurrency = max(1, concurrency)
+        self.semaphore = asyncio.Semaphore(max(1, concurrency))
+        self._active = 0
+
+    async def acquire(self) -> bool:
+        """尝试获取调用槽位"""
+        if self.semaphore.locked():
+            return False
+        await self.semaphore.acquire()
+        self._active += 1
+        return True
+
+    def release(self) -> None:
+        """释放调用槽位"""
+        self.semaphore.release()
+        self._active = max(0, self._active - 1)
+
+    @property
+    def active(self) -> int:
+        return self._active
+
+
 class EndpointPool:
-    """多实例端点池并发管理器（同步版本）"""
+    """多实例端点池并发管理器（异步版本 + 负载均衡）"""
 
     def __init__(self, endpoints: list[dict]):
         self._endpoints = endpoints or []
-        self._available: deque = deque()
+        self._instances: list[EndpointInstance] = []
+        self._lock = asyncio.Lock()
+        self._current = 0
         self._init_pool()
 
     def _init_pool(self):
@@ -21,23 +51,61 @@ class EndpointPool:
             return
         for ep in self._endpoints:
             url = ep.get("url", "")
-            concurrency = ep.get("concurrency", 4)
-            for _ in range(max(1, concurrency)):
-                self._available.append(url)
+            if url:
+                conc = ep.get("concurrency", 4)
+                self._instances.append(EndpointInstance(url, conc))
 
-    def get_endpoint(self) -> str | None:
-        """获取一个可用端点URL（轮询负载均衡）"""
-        if not self._available:
+    async def get_endpoint(self) -> str | None:
+        """获取一个可用端点URL（加权轮询负载均衡）"""
+        if not self._instances:
             if self._endpoints:
                 return self._endpoints[0].get("url")
             return None
-        url = self._available.popleft()
-        self._available.append(url)
-        return url
+
+        async with self._lock:
+            tried = 0
+            start = self._current
+            while tried < len(self._instances):
+                idx = self._current % len(self._instances)
+                inst = self._instances[idx]
+                if inst.semaphore.locked():
+                    self._current += 1
+                    tried += 1
+                    continue
+                self._current += 1
+                return inst.url
+            
+            inst = self._instances[start % len(self._instances)]
+            await inst.semaphore.acquire()
+            inst._active += 1
+            return inst.url
 
     def release_endpoint(self, url: str):
-        """释放端点回池（同步版本无需操作，端点一直在循环中）"""
-        pass
+        """释放端点"""
+        if not url:
+            return
+        for inst in self._instances:
+            if inst.url == url:
+                try:
+                    inst.release()
+                except RuntimeError:
+                    pass
+                break
+
+    def get_total_concurrency(self) -> int:
+        """获取总并发数"""
+        return sum(inst.concurrency for inst in self._instances) or 4
+
+    def get_status(self) -> list[dict]:
+        """获取端点池状态"""
+        return [
+            {
+                "url": inst.url,
+                "limit": inst.concurrency,
+                "active": inst._active,
+            }
+            for inst in self._instances
+        ]
 
     @property
     def endpoints(self) -> list[dict]:

@@ -198,6 +198,11 @@ import type { GenerationMessage } from '@renderer/types/instruction'
 
 const props = defineProps<{
   visible: boolean
+  cardTitle?: string
+  panelMessages?: GenerationMessage[]
+  panelGenerating?: boolean
+  panelPaused?: boolean
+  panelCompleted?: number
 }>()
 
 const emit = defineEmits<{
@@ -206,16 +211,30 @@ const emit = defineEmits<{
   continue: [userMessage: string]
   stop: []
   restart: []
-  finish: [] // 新增 finish 事件
+  finish: []
 }>()
 
 // ==================== 状态管理 ====================
+// 如果传入了外部状态则使用外部，否则使用本地
 
-const isGenerating = ref(false)
-const isPaused = ref(false)
-const isFinishedState = ref(false) // 明确的完成状态
-const messages = ref<GenerationMessage[]>([])
-const completedFields = ref(0)
+const localGenerating = ref(false)
+const localPaused = ref(false)
+const localMessages = ref<GenerationMessage[]>([])
+const localCompleted = ref(0)
+
+// 如果有外部传入的状态，直接使用 ref；否则用本地的
+const useExternalState = props.panelGenerating !== undefined || props.panelMessages !== undefined
+
+const effectiveGenerating = useExternalState ? props.panelGenerating! : localGenerating
+const effectivePaused = useExternalState ? props.panelPaused! : localPaused
+const effectiveMessages = props.panelMessages || localMessages
+const effectiveCompleted = props.panelCompleted ?? localCompleted
+
+const isGenerating = ref(effectiveGenerating)
+const isPaused = ref(effectivePaused)
+const messages = ref(effectiveMessages)
+const completedFields = ref(effectiveCompleted)
+const isFinishedState = ref(false)
 const userInput = ref('')
 const messagesContainer = ref<HTMLElement>()
 const panelRef = ref<HTMLElement>()
@@ -227,7 +246,7 @@ const isDragging = ref(false)
 const dragOffset = ref({ x: 0, y: 0 })
 
 // 计算属性：是否处于完成态
-const isFinished = computed(() => isFinishedState.value)
+const isFinished = computed(() => isFinishedState.value || (isGenerating.value === false && messages.value.length > 0))
 
 // 计算面板样式
 const panelStyle = computed(() => {

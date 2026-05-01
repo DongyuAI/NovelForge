@@ -158,16 +158,36 @@
           <CardMarket @edit-card="handleEditCard" />
         </el-tab-pane>
         <el-tab-pane label="编辑器" name="editor">
-          <template v-if="activeCard">
-            <CardEditorHost :card="activeCard" :prefetched="prefetchedContext" />
-          </template>
-          <el-empty v-else description="请从左侧选择一个卡片进行编辑" />
+          <keep-alive>
+            <template v-if="activeCard">
+              <CardEditorHost :card="activeCard" :prefetched="prefetchedContext" />
+            </template>
+          </keep-alive>
+          <el-empty v-if="!activeCard" description="请从左侧选择一个卡片进行编辑" />
         </el-tab-pane>
         <el-tab-pane label="关系图管理" name="relation-graph">
           <RelationGraphPanel :refresh-seq="relationGraphRefreshSeq" />
         </el-tab-pane>
       </el-tabs>
     </el-main>
+
+    <!-- 全局生成浮窗容器 - 固定在右下角 -->
+    <div class="global-generation-panels">
+      <GenerationPanel
+        v-for="gen in generationStore.activeGenerations"
+        :key="gen.cardId"
+        :visible="true"
+        :card-title="gen.cardTitle"
+        :panel-messages="gen.messages as any"
+        :panel-generating="gen.isGenerating"
+        :panel-paused="gen.isPaused"
+        :panel-completed="gen.completedFields"
+        @close="generationStore.closeGeneration(gen.cardId)"
+        @pause="generationStore.pauseGeneration(gen.cardId)"
+        @continue="(msg) => generationStore.resumeGeneration(gen.cardId, msg)"
+        @stop="generationStore.stopGeneration(gen.cardId)"
+      />
+    </div>
 
     <!-- 右侧助手面板分隔条与面板 -->
     <div class="resizer right-resizer" @mousedown="startResizing('right')"></div>
@@ -374,6 +394,7 @@ import { useSidebarResizer } from '@renderer/composables/useSidebarResizer'
 import AssistantPanel from '@renderer/components/assistants/AssistantPanel.vue'
 import ContextPanel from '@renderer/components/panels/ContextPanel.vue'
 import ChapterToolsPanel from '@renderer/components/panels/ChapterToolsPanel.vue'
+import GenerationPanel from '@renderer/components/generation/GenerationPanel.vue'
 import OutlinePanel from '@renderer/components/panels/OutlinePanel.vue'
 import ReviewHistoryPanel from '@renderer/components/panels/ReviewHistoryPanel.vue'
 import RelationGraphPanel from '@renderer/components/panels/RelationGraphPanel.vue'
@@ -381,6 +402,7 @@ import { useCardStore } from '@renderer/stores/useCardStore'
 import { useEditorStore } from '@renderer/stores/useEditorStore'
 import { useProjectStore } from '@renderer/stores/useProjectStore'
 import { useAssistantStore } from '@renderer/stores/useAssistantStore'
+import { useGenerationStore } from '@renderer/stores/useGenerationStore'
 import SchemaStudio from '@renderer/components/shared/SchemaStudio.vue'
 import { getCardSchema, createCardType } from '@renderer/api/setting'
 import { getProjects } from '@renderer/api/projects'
@@ -473,12 +495,13 @@ function openExportDialog() {
  }>()
 
  // Store
- const cardStore = useCardStore()
- const { cardTree, activeCard, cards } = storeToRefs(cardStore)
- const editorStore = useEditorStore()
- const { expandedKeys } = storeToRefs(editorStore)
- const projectStore = useProjectStore()
- const assistantStore = useAssistantStore()
+const cardStore = useCardStore()
+  const { cardTree, activeCard, cards } = storeToRefs(cardStore)
+  const editorStore = useEditorStore()
+  const { expandedKeys } = storeToRefs(editorStore)
+  const projectStore = useProjectStore()
+  const assistantStore = useAssistantStore()
+  const generationStore = useGenerationStore()
  const isFreeProject = computed(() => (projectStore.currentProject?.name || '') === '__free__')
 
   // --- 前端自动分组器 ---

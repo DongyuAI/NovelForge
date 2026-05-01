@@ -5,6 +5,53 @@
       <el-button type="primary" size="small" @click="openEditDialog()">新增配置</el-button>
     </div>
 
+    <!-- 实时并发状态 -->
+    <div class="status-panel" v-if="llmStatus">
+      <div class="status-title">
+        <span>并发状态</span>
+        <el-button size="small" text @click="refreshStatus" :loading="statusLoading">
+          <el-icon><Refresh /></el-icon> 刷新
+        </el-button>
+      </div>
+      <div class="status-cards">
+        <!-- 全局状态 -->
+        <div class="status-card global">
+          <div class="card-label">全局并发</div>
+          <div class="card-value">
+            <span class="active">{{ llmStatus.global.active }}</span>
+            <span class="sep">/</span>
+            <span class="limit">{{ llmStatus.global.limit }}</span>
+          </div>
+        </div>
+        <!-- 各实例状态 -->
+        <div 
+          v-for="(info, id) in llmStatus.instances" 
+          :key="id" 
+          class="status-card"
+          :class="{ active: info.active > 0 }"
+        >
+          <div class="card-label">{{ info.display_name || `ID:${id}` }}</div>
+          <div class="card-value">
+            <span class="active">{{ info.active }}</span>
+            <span class="sep">/</span>
+            <span class="limit">{{ info.limit }}</span>
+          </div>
+          <!-- 端点池详情 -->
+          <div class="endpoint-pool" v-if="info.endpoint_pool?.length">
+            <div 
+              v-for="(ep, idx) in info.endpoint_pool" 
+              :key="idx" 
+              class="endpoint-item"
+              :class="{ busy: ep.active >= ep.limit }"
+            >
+              <span class="ep-url">{{ ep.url }}</span>
+              <span class="ep-active">{{ ep.active }}/{{ ep.limit }}</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <el-table :data="llmConfigs" style="width: 100%" size="small">
       <el-table-column prop="display_name" label="显示名称" width="150" />
       <el-table-column prop="provider" label="提供商" width="120" />
@@ -66,41 +113,34 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, onUnmounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { QuestionFilled } from '@element-plus/icons-vue'
+import { QuestionFilled, Refresh } from '@element-plus/icons-vue'
 import LLMConfigForm from './LLMConfigForm.vue'
 import type { components } from '@renderer/types/generated'
-import { listLLMConfigs, createLLMConfig, updateLLMConfig, deleteLLMConfig, resetLLMUsage, copyLLMConfig } from '@renderer/api/setting'
+import { listLLMConfigs, createLLMConfig, updateLLMConfig, deleteLLMConfig, resetLLMUsage, copyLLMConfig, getLLMStatus, type LLMStatus } from '@renderer/api/setting'
 
 type LLMConfig = components['schemas']['LLMConfigRead']
 
 const llmConfigs = ref<LLMConfig[]>([])
 const editDialogVisible = ref(false)
 const editConfig = ref<LLMConfig | null>(null)
+const llmStatus = ref<LLMStatus | null>(null)
+const statusLoading = ref(false)
+let statusTimer: number | null = null
 
-/**
- * 格式化数字显示
- * @param num 数字
- * @returns 格式化后的字符串
- */
 function formatNumber(num: number): string {
   if (num >= 1000000) {
-    // 大于等于1百万，显示为 X.XXX 百万
     const millions = num / 1000000
     const formatted = millions.toFixed(3)
-    // 去除末尾的0
     const trimmed = parseFloat(formatted).toString()
     return `${trimmed} 百万`
   } else if (num >= 10000) {
-    // 大于等于1万，显示为 X.XXX 万
     const tenThousands = num / 10000
     const formatted = tenThousands.toFixed(3)
-    // 去除末尾的0
     const trimmed = parseFloat(formatted).toString()
     return `${trimmed} 万`
   } else {
-    // 小于1万，直接显示原数字
     return num.toString()
   }
 }
@@ -111,6 +151,31 @@ async function loadLLMConfigs() {
   } catch (error) {
     console.error('Failed to load LLM configs:', error)
     ElMessage.error('加载LLM配置失败')
+  }
+}
+
+async function loadLLMStatus() {
+  try {
+    llmStatus.value = await getLLMStatus()
+  } catch (error) {
+    console.error('Failed to load LLM status:', error)
+  }
+}
+
+async function refreshStatus() {
+  statusLoading.value = true
+  await loadLLMStatus()
+  statusLoading.value = false
+}
+
+function startStatusPolling() {
+  statusTimer = window.setInterval(loadLLMStatus, 2000)
+}
+
+function stopStatusPolling() {
+  if (statusTimer) {
+    clearInterval(statusTimer)
+    statusTimer = null
   }
 }
 
@@ -188,7 +253,12 @@ async function handleCopy(row: LLMConfig) {
 
 // 暴露 refresh 给父组件调用
 defineExpose({ refresh: loadLLMConfigs })
-onMounted(loadLLMConfigs)
+onMounted(() => {
+  loadLLMConfigs()
+  loadLLMStatus()
+  startStatusPolling()
+})
+onUnmounted(stopStatusPolling)
 </script>
 
 <style scoped>
@@ -197,5 +267,101 @@ onMounted(loadLLMConfigs)
   justify-content: space-between;
   align-items: center;
   margin-bottom: 12px;
+}
+
+.status-panel {
+  background: var(--el-fill-color-light);
+  border-radius: 8px;
+  padding: 12px;
+  margin-bottom: 16px;
+}
+
+.status-title {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 10px;
+  font-weight: 600;
+  color: var(--el-text-color-primary);
+}
+
+.status-cards {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.status-card {
+  background: var(--el-bg-color);
+  border: 1px solid var(--el-border-color-light);
+  border-radius: 6px;
+  padding: 8px 12px;
+  min-width: 120px;
+}
+
+.status-card.global {
+  border-color: var(--el-color-primary);
+}
+
+.status-card.active {
+  border-color: var(--el-color-warning);
+}
+
+.card-label {
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+  margin-bottom: 4px;
+}
+
+.card-value {
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.card-value .active {
+  color: var(--el-color-primary);
+}
+
+.status-card.active .card-value .active {
+  color: var(--el-color-warning);
+}
+
+.card-value .sep {
+  color: var(--el-text-color-placeholder);
+  margin: 0 2px;
+}
+
+.card-value .limit {
+  color: var(--el-text-color-regular);
+}
+
+.endpoint-pool {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px dashed var(--el-border-color-lighter);
+}
+
+.endpoint-item {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  padding: 2px 0;
+}
+
+.endpoint-item.busy .ep-active {
+  color: var(--el-color-danger);
+}
+
+.ep-url {
+  color: var(--el-text-color-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 150px;
+}
+
+.ep-active {
+  color: var(--el-text-color-regular);
+  font-weight: 500;
 }
 </style>

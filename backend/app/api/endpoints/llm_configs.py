@@ -14,7 +14,7 @@ from app.schemas.llm_config import (
 )
 from app.schemas.response import ApiResponse
 from app.services import llm_config_service
-from app.services.ai.core.chat_model_factory import build_chat_model_from_payload
+from app.services.ai.core.chat_model_factory import build_chat_model_from_payload, get_llm_status
 
 
 router = APIRouter()
@@ -129,3 +129,17 @@ def copy_llm_config_endpoint(config_id: int, session: Session = Depends(get_sess
     if not config:
         raise HTTPException(status_code=404, detail="LLM Config not found")
     return ApiResponse(data=config, message="LLM Config copied successfully")
+
+
+@router.get("/status", response_model=ApiResponse[dict], summary="获取 LLM 并发状态")
+def get_llm_status_endpoint(session: Session = Depends(get_session)):
+    configs = llm_config_service.get_llm_configs(session)
+    status = get_llm_status()
+    for cfg in configs:
+        pool = llm_config_service.get_endpoint_pool(cfg.id, cfg.endpoints)
+        status["instances"][cfg.id] = {
+            **status["instances"].get(cfg.id, {}),
+            "display_name": cfg.display_name or cfg.model_name,
+            "endpoint_pool": pool.get_status() if pool else [],
+        }
+    return ApiResponse(data=status)

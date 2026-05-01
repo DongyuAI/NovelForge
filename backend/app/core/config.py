@@ -134,8 +134,8 @@ class BootstrapSettings(BaseSettings):
 class AISettings(BaseSettings):
     """AI相关配置"""
     
-    # 模型调用失败时最大重试次数
     max_tool_call_retries: int = Field(default=3, alias="MAX_TOOL_CALL_RETRIES")
+    llm_concurrency_limit: int = Field(default=30, alias="LLM_CONCURRENCY_LIMIT")
     
     class Config:
         env_file = ".env"

@@ -12,7 +12,12 @@ from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, Base
 from pydantic import ValidationError
 from loguru import logger
 
-from app.services.ai.core.chat_model_factory import build_chat_model
+from app.services.ai.core.chat_model_factory import (
+    build_chat_model,
+    _get_instance_semaphore,
+    _get_global_sem,
+    _get_instance_concurrency,
+)
 from app.services.ai.core.quota_manager import precheck_quota, record_usage
 from app.services.ai.core.token_utils import estimate_tokens
 from app.services.ai.core.model_builder import build_model_from_json_schema
@@ -76,7 +81,12 @@ async def generate_instruction_stream(
     Yields:
         事件字典，包含 type 和对应的数据
     """
-    # 构建 ChatModel
+    instance_concurrency = _get_instance_concurrency(session, llm_config_id)
+    instance_sem = _get_instance_semaphore(llm_config_id, instance_concurrency)
+
+    await instance_sem.acquire()
+    await _get_global_sem().acquire()
+
     try:
         chat_model = build_chat_model(
             session=session,
@@ -87,17 +97,20 @@ async def generate_instruction_stream(
         )
     except Exception as e:
         logger.error(f"构建 ChatModel 失败: {e}")
+        instance_sem.release()
+        _get_global_sem().release()
         yield {
             "type": "error",
             "text": f"初始化 LLM 失败: {str(e)}"
         }
         return
     
-    # 创建 Pydantic 动态模型（用于最终验证）
     try:
         DynamicModel = build_model_from_json_schema('DynamicResponseModel', schema)
     except Exception as e:
         logger.error(f"创建动态模型失败: {e}")
+        instance_sem.release()
+        _get_global_sem().release()
         yield {
             "type": "error",
             "text": f"Schema 解析失败: {str(e)}"
@@ -668,6 +681,9 @@ async def generate_instruction_stream(
             "type": "error",
             "text": f"生成失败：达到最大重试次数 {max_retry}"
         }
+
+    instance_sem.release()
+    _get_global_sem().release()
 
 
 def try_parse_instruction(line: str) -> Optional[Dict[str, Any]]:
